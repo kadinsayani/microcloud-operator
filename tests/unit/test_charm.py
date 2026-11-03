@@ -11,7 +11,7 @@ import logging
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -53,10 +53,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 import session
 from ceph_mgr import CephMgrPrometheus
+from cluster_relation import ClusterRelation
 from failure_domains import FailureDomains
 from network import UnitNetwork
 from observability import Observability
 from ovn_exporter import OVNExporter
+
+
+def _no_member_relations():
+    relations = MagicMock(spec=ClusterRelation)
+    relations.members_relations.return_value = []
+    return relations
+
 
 # ---------------------------------------------------------------------------
 # logging (Loki) relation handlers
@@ -352,11 +360,11 @@ class TestPreseed:
                         address="10.0.0.1",
                         storage_local_path="/dev/nvme0n1",
                         storage_ceph_paths=["/dev/nvme1n1", "/dev/nvme2n1"],
+                        storage_wipe=True,
                     ),
                     SystemEntry(name="node2", address="10.0.0.2"),
                 ],
                 with_ceph=True,
-                storage_wipe=True,
             )
         )
         assert doc["systems"][0]["storage"]["local"] == {
@@ -368,6 +376,36 @@ class TestPreseed:
             {"path": "/dev/nvme2n1", "wipe": True},
         ]
         assert "storage" not in doc["systems"][1]
+
+    def test_storage_options_follow_the_system_that_owns_the_disks(self):
+        from preseed import SystemEntry, build_preseed
+
+        doc = build_preseed(
+            self._inputs(
+                systems=[
+                    SystemEntry(
+                        name="orchestrator",
+                        address="10.0.0.1",
+                        storage_ceph_paths=["/dev/sdb"],
+                        storage_wipe=True,
+                    ),
+                    SystemEntry(
+                        name="member",
+                        address="10.0.0.2",
+                        storage_local_path="/dev/sdc",
+                        storage_ceph_paths=["/dev/sdd"],
+                        storage_encrypt=True,
+                    ),
+                ],
+                with_ceph=True,
+            )
+        )
+
+        assert doc["systems"][0]["storage"]["ceph"] == [{"path": "/dev/sdb", "wipe": True}]
+        assert doc["systems"][1]["storage"] == {
+            "local": {"path": "/dev/sdc", "encrypt": True},
+            "ceph": [{"path": "/dev/sdd", "encrypt": True}],
+        }
 
     def test_storage_omitted_without_paths(self):
         from preseed import build_preseed
@@ -475,7 +513,7 @@ peers:
         harness.begin()
         return harness
 
-    def test_all_systems_includes_ovn_fields(self):
+    def test_peer_systems_includes_ovn_fields(self):
         from cluster import ClusterCoordinator, PeerSystem
 
         harness = self._harness()
@@ -505,7 +543,7 @@ peers:
                 },
             )
 
-            systems = coordinator.all_systems()
+            systems = coordinator.peer_systems()
             assert (
                 PeerSystem(
                     name="node0",
@@ -535,7 +573,7 @@ peers:
         finally:
             harness.cleanup()
 
-    def test_all_systems_defaults_empty_ovn_fields(self):
+    def test_peer_systems_defaults_empty_ovn_fields(self):
         from cluster import ClusterCoordinator, PeerSystem
 
         harness = self._harness()
@@ -545,7 +583,7 @@ peers:
 
             coordinator.publish_identity("node0", "10.0.0.1")
 
-            assert coordinator.all_systems() == [PeerSystem(name="node0", address="10.0.0.1")]
+            assert coordinator.peer_systems() == [PeerSystem(name="node0", address="10.0.0.1")]
         finally:
             harness.cleanup()
 
@@ -560,6 +598,7 @@ class TestPreseedInputs:
         network = MagicMock(spec=UnitNetwork)
         network.space_network_cidr.side_effect = lambda name: cidrs.get(name, "")
         return session.JoinSessions(
+            relations=_no_member_relations(),
             unit=MagicMock(),
             coordinator=MagicMock(),
             network=network,
@@ -880,7 +919,7 @@ class TestHeldStatus:
             patch("charm.microcloud.hostname", return_value="node1"),
             patch("charm.microcloud.is_initialized", return_value=False),
         ):
-            MicroCloudCharm._reconcile(stub)
+            _reconcile_orchestrator(stub)
 
         stub._set_status.assert_not_called()
 
@@ -901,7 +940,7 @@ class TestHeldStatus:
             patch("charm.microcloud.hostname", return_value="node1"),
             patch("charm.microcloud.is_initialized", return_value=False),
         ):
-            MicroCloudCharm._reconcile(stub)
+            _reconcile_orchestrator(stub)
 
         stub._set_status.assert_called_once_with(initialized=False)
 
@@ -1228,7 +1267,7 @@ peers:
             # A member of a cluster formed outside Juju, which never reports ready.
             self._publish(harness, rel_id, "test-charm/1", "node1", "10.0.0.1", True)
             self._publish(harness, rel_id, "test-charm/2", "node2", "10.0.0.2", False)
-            pending = [system for system in coordinator.all_systems() if system.name == "node2"]
+            pending = [system for system in coordinator.peer_systems() if system.name == "node2"]
 
             assert coordinator.all_ready(pending) is False
 
@@ -1279,7 +1318,7 @@ class TestGrowCharm:
         stub._storage_ceph_paths.return_value = ([], None)
         stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
         coordinator = stub._coordinator = MagicMock()
-        coordinator.all_systems.return_value = list(systems)
+        coordinator.peer_systems.return_value = list(systems)
         coordinator.all_ready.return_value = True
         coordinator.any_initialized.return_value = False
         coordinator.session.return_value = current
@@ -1371,7 +1410,6 @@ class TestGrowCharm:
     # ---- _reconcile ----
 
     def _reconcile(self, stub, *, initialized, members):
-        from charm import MicroCloudCharm
         from microcloud import Member
 
         stub._cos_related.return_value = False
@@ -1387,6 +1425,7 @@ class TestGrowCharm:
             stub.charm_dir,
             stub._stored,
             stub._hold_status,
+            _no_member_relations(),
         ).pending(initialized)
 
         with (
@@ -1398,7 +1437,7 @@ class TestGrowCharm:
                 return_value=[Member(name, "") for name in members],
             ) as list_members,
         ):
-            MicroCloudCharm._reconcile(stub)
+            _reconcile_orchestrator(stub)
         return list_members
 
     def _lagging_coordinator(self, stub, systems, current=None):
@@ -1459,7 +1498,6 @@ class TestGrowCharm:
         import ops
 
         import microcloud
-        from charm import MicroCloudCharm
 
         stub = self._stub(leader=True)
         self._lagging_coordinator(stub, [self._system("node1", "10.0.0.2")])
@@ -1471,6 +1509,7 @@ class TestGrowCharm:
             stub.charm_dir,
             stub._stored,
             stub._hold_status,
+            _no_member_relations(),
         ).pending(initialized)
 
         with (
@@ -1481,7 +1520,7 @@ class TestGrowCharm:
                 side_effect=microcloud.MicroCloudError("boom"),
             ),
         ):
-            MicroCloudCharm._reconcile(stub)
+            _reconcile_orchestrator(stub)
 
         assert isinstance(stub.unit.status, ops.BlockedStatus)
         stub._reconcile_deploy.assert_not_called()
@@ -1504,6 +1543,7 @@ class TestJoinSessions:
         stored = stored or SimpleNamespace(session_failures=0, worker_pid=0, worker_session="")
         hold_status = MagicMock()
         return session.JoinSessions(
+            relations=_no_member_relations(),
             unit=unit,
             coordinator=coordinator,
             network=network,
@@ -1571,7 +1611,7 @@ class TestJoinSessions:
         import ops
 
         coordinator = MagicMock()
-        coordinator.all_systems.return_value = list(systems)
+        coordinator.peer_systems.return_value = list(systems)
         coordinator.session.return_value = current
 
         network = MagicMock(spec=UnitNetwork)
@@ -1586,6 +1626,7 @@ class TestJoinSessions:
             unit.status = status
 
         sessions = session.JoinSessions(
+            relations=_no_member_relations(),
             unit=unit,
             coordinator=coordinator,
             network=network,
@@ -1720,7 +1761,7 @@ class TestJoinSessions:
         import ops
 
         coordinator = MagicMock()
-        coordinator.all_systems.return_value = list(systems)
+        coordinator.peer_systems.return_value = list(systems)
         coordinator.all_ready.return_value = True
         coordinator.any_initialized.return_value = False
         coordinator.session.return_value = current
@@ -1739,6 +1780,7 @@ class TestJoinSessions:
             unit.status = status
 
         sessions = session.JoinSessions(
+            relations=_no_member_relations(),
             unit=unit,
             coordinator=coordinator,
             network=network,
@@ -2114,6 +2156,7 @@ class TestSessionWorkerHelpers:
         unit.name = "microcloud/0"
         stored = SimpleNamespace(worker_pid=pid, worker_session=session_id)
         return session.JoinSessions(
+            relations=_no_member_relations(),
             unit=unit,
             coordinator=MagicMock(),
             network=MagicMock(spec=UnitNetwork),
@@ -2143,6 +2186,22 @@ class TestSessionWorkerHelpers:
 # ---------------------------------------------------------------------------
 # Failure domains
 # ---------------------------------------------------------------------------
+
+
+def _reconcile_orchestrator(stub):
+    """Run _reconcile on a stub of an orchestrator unit, through its real steps."""
+    from charm import MicroCloudCharm
+
+    stub._check_cluster_mode.return_value = None
+    stub._is_orchestrator.return_value = True
+    stub._reconcile_orchestrator.side_effect = lambda initialized: (
+        MicroCloudCharm._reconcile_orchestrator(stub, initialized)
+    )
+    stub._reconcile_clustered.side_effect = lambda initialized: (
+        MicroCloudCharm._reconcile_clustered(stub, initialized)
+    )
+    stub._sessions.has_member_candidates.return_value = False
+    MicroCloudCharm._reconcile(stub)
 
 
 def _member(name, domain="zone-1", roles=(), status="Online", arch="x86_64"):
@@ -2284,7 +2343,6 @@ class TestFailureDomains:
         return stub
 
     def _reconcile(self, stub, *, initialized=True, lxd_clustered=True):
-        from charm import MicroCloudCharm
 
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
@@ -2306,7 +2364,7 @@ class TestFailureDomains:
             patch("charm.microcloud.is_initialized", side_effect=[initialized, True]),
             patch("charm.lxd_cluster.is_clustered", return_value=lxd_clustered),
         ):
-            MicroCloudCharm._reconcile(stub)
+            _reconcile_orchestrator(stub)
 
     @pytest.mark.parametrize("initialized", [True, False])
     def test_only_a_unit_clustered_when_the_hook_starts_sets_its_failure_domain(self, initialized):
@@ -2316,6 +2374,18 @@ class TestFailureDomains:
         self._reconcile(stub, initialized=initialized)
 
         assert stub._failure_domains.reconcile.called is initialized
+
+    @pytest.mark.parametrize(("systems", "reconciled"), [(["node1"], False), (["node2"], True)])
+    def test_a_unit_listed_in_the_open_session_waits_to_set_its_failure_domain(
+        self, systems, reconciled
+    ):
+        """LXD reads as clustered before its join has ended."""
+        stub = self._stub()
+        stub._open_session.return_value = MagicMock(systems=systems)
+
+        self._reconcile(stub)
+
+        assert stub._failure_domains.reconcile.called is reconciled
 
     def _await_stub(self, *, since=0.0, session=None, now=1000.0):
         from charm import MicroCloudCharm
@@ -2328,6 +2398,7 @@ class TestFailureDomains:
         stub._coordinator.session.return_value = session
         stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
         with patch("charm.time.time", return_value=now):
+            stub._open_session.side_effect = stub._coordinator.session
             problem = MicroCloudCharm._await_lxd_join(stub)
         return stub, problem
 
@@ -2389,7 +2460,6 @@ class TestFailureDomains:
         import ops
 
         import lxd_cluster
-        from charm import MicroCloudCharm
 
         stub = self._stub()
         stub.unit.is_leader.return_value = False
@@ -2407,7 +2477,7 @@ class TestFailureDomains:
                 "charm.lxd_cluster.is_clustered", side_effect=lxd_cluster.LXDClusterError("boom")
             ),
         ):
-            MicroCloudCharm._reconcile(stub)
+            _reconcile_orchestrator(stub)
 
         assert stub.unit.status == ops.BlockedStatus("Cannot read the LXD cluster: boom")
         stub._failure_domains.reconcile.assert_not_called()
@@ -2421,6 +2491,7 @@ class TestFailureDomains:
         stub._cos_related.return_value = False
         stub._control_plane = MagicMock(spec=ControlPlane)
         stub._control_plane.coverage_warning.return_value = warning
+        stub._is_orchestrator.return_value = True
         MicroCloudCharm._set_status(stub, initialized=True)
         return stub
 
@@ -2457,6 +2528,10 @@ class TestFailureDomains:
         stub._control_plane = MagicMock(spec=ControlPlane)
         stub._control_plane.mode.return_value = "inactive (0 of 3 role holders)"
         stub._control_plane.mode.side_effect = mode_side_effect
+        stub._is_orchestrator.return_value = True
+        stub._coordinator = MagicMock()
+        stub._coordinator.cluster_mode.return_value = "orchestrator"
+        stub.unit.is_leader.return_value = False
         event = MagicMock()
         cluster = [_member("node1", "zone-1")]
         with (
@@ -2484,3 +2559,611 @@ class TestFailureDomains:
         assert "members" in results
         assert "control-plane-mode" not in results
         assert results["control-plane-mode-error"] == "boom"
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator and member applications
+# ---------------------------------------------------------------------------
+
+
+def _relation(app, relation_id=7):
+    relation = MagicMock()
+    relation.id = relation_id
+    relation.app.name = app
+    return relation
+
+
+class TestClusterMode:
+    def _stub(self, *, orchestrator, recorded="", leader=True, config=None):
+        from charm import MicroCloudCharm
+        from cluster_relation import ClusterRelation
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.unit.is_leader.return_value = leader
+        stub.config = {"snap-channel-microceph": "tentacle/stable", **(config or {})}
+        stub._is_orchestrator.return_value = orchestrator
+        stub._coordinator = MagicMock()
+        stub._coordinator.cluster_mode.return_value = recorded
+        stub._coordinator.any_initialized.return_value = False
+        stub._relations = MagicMock(spec=ClusterRelation)
+        stub._relations.members_relations.return_value = []
+        stub._relations.orchestrator_relation.return_value = None
+        stub._relations.remote_role.return_value = ""
+        return stub
+
+    def _check(self, stub, initialized=False):
+        from charm import MicroCloudCharm
+
+        return MicroCloudCharm._check_cluster_mode(stub, initialized)
+
+    @pytest.mark.parametrize("orchestrator", [True, False])
+    def test_leader_records_the_mode_until_the_cluster_forms(self, orchestrator):
+        stub = self._stub(orchestrator=orchestrator, recorded="member")
+
+        assert self._check(stub) is None
+        stub._relations.publish_role.assert_called_once_with(orchestrator)
+        if orchestrator:
+            stub._coordinator.record_cluster_mode.assert_called_once_with("orchestrator")
+        else:
+            stub._coordinator.record_cluster_mode.assert_not_called()
+
+    def test_mode_cannot_change_after_the_cluster_formed(self):
+        stub = self._stub(orchestrator=False, recorded="orchestrator")
+
+        problem = self._check(stub, initialized=True)
+
+        assert problem == (
+            "orchestrator cannot change after the cluster formed (formed as orchestrator)"
+        )
+        stub._coordinator.record_cluster_mode.assert_not_called()
+
+    def test_orchestrator_rejects_the_orchestrator_endpoint(self):
+        stub = self._stub(orchestrator=True)
+        stub._relations.orchestrator_relation.return_value = _relation("main")
+
+        assert self._check(stub) == "orchestrator endpoint needs orchestrator=false"
+
+    def test_member_rejects_the_members_endpoint(self):
+        stub = self._stub(orchestrator=False)
+        stub._relations.members_relations.return_value = [_relation("arm")]
+
+        assert self._check(stub) == "members endpoint needs orchestrator=true"
+
+    def test_orchestrator_rejects_another_orchestrator_on_members(self):
+        stub = self._stub(orchestrator=True)
+        stub._relations.members_relations.return_value = [_relation("other")]
+        stub._relations.remote_role.return_value = "true"
+
+        assert self._check(stub) == "other on members has orchestrator=true"
+
+    def test_member_rejects_a_remote_that_is_no_orchestrator(self):
+        stub = self._stub(orchestrator=False)
+        stub._relations.orchestrator_relation.return_value = _relation("arm")
+        stub._relations.remote_role.return_value = "false"
+
+        assert self._check(stub) == "arm on orchestrator has orchestrator=false"
+
+    def test_members_relation_needs_microceph(self):
+        stub = self._stub(orchestrator=True, config={"snap-channel-microceph": ""})
+        stub._relations.members_relations.return_value = [_relation("arm")]
+
+        assert self._check(stub) == "members relation needs MicroCeph (snap-channel-microceph)"
+
+
+class TestMemberReconcile:
+    _SYSTEM = {
+        "name": "arm0",
+        "address": "10.0.1.1",
+        "ovn_uplink_interface": "",
+        "ovn_underlay_ip": "",
+        "storage_local_path": "",
+        "storage_ceph_paths": [],
+        "initialized": False,
+    }
+
+    def _stub(self, *, facts=None, relation=True, mode="member"):
+        from charm import MicroCloudCharm
+        from cluster_relation import ClusterRelation, OrchestratorFacts
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.unit.is_leader.return_value = False
+        stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
+        stub._coordinator = MagicMock()
+        stub._coordinator.cluster_mode.return_value = mode
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._relations = MagicMock(spec=ClusterRelation)
+        stub._relations.orchestrator_relation.return_value = (
+            _relation("main") if relation else None
+        )
+        stub._relations.facts.return_value = facts or OrchestratorFacts(
+            snap_channels={"lxd": "6/stable", "microcloud": "3/stable"},
+            service_versions={"lxd": "6.9"},
+            initialized=True,
+            storage=[],
+        )
+        stub._relations.passphrase.return_value = "secret"
+        stub._match_service_versions.side_effect = lambda *args: (
+            MicroCloudCharm._match_service_versions(stub, *args)
+        )
+        stub._member_storage_problem.side_effect = MicroCloudCharm._member_storage_problem
+        stub._member_prerequisites.side_effect = lambda *args: (
+            MicroCloudCharm._member_prerequisites(stub, *args)
+        )
+        stub._sessions = MagicMock()
+        stub._sessions.join_member.return_value = None
+        return stub
+
+    def _reconcile(self, stub, system=None, versions=None):
+        from charm import MicroCloudCharm
+
+        with (
+            patch("charm.snap.ensure_installed") as ensure_installed,
+            patch(
+                "charm.snap.service_versions",
+                return_value=versions or {"lxd": "6.9", "microcloud": "3.2"},
+            ),
+            patch("charm.snap.install") as install,
+            patch("charm.snap.hold"),
+            patch("charm.microcloud.waitready", return_value=True),
+        ):
+            problem = MicroCloudCharm._reconcile_member(stub, False, system or self._SYSTEM)
+        return problem, ensure_installed, install
+
+    def test_waits_for_the_orchestrator_relation(self):
+        stub = self._stub(relation=False)
+
+        problem, ensure_installed, _ = self._reconcile(stub)
+
+        assert problem is None
+        ensure_installed.assert_not_called()
+        assert "Waiting for orchestrator relation" in stub.unit.status.message
+
+    def test_installs_the_orchestrator_channels_and_joins(self):
+        stub = self._stub()
+
+        problem, ensure_installed, install = self._reconcile(stub)
+
+        assert problem is None
+        ensure_installed.assert_called_once_with({"lxd": "6/stable", "microcloud": "3/stable"})
+        install.assert_not_called()
+        stub._relations.publish_member.assert_any_call({}, ready=True)
+        stub._sessions.join_member.assert_called_once()
+
+    def test_refreshes_differing_snaps_and_blocks_while_they_still_differ(self):
+        stub = self._stub()
+
+        problem, _, install = self._reconcile(stub, versions={"lxd": "6.10", "microcloud": "3.2"})
+
+        install.assert_called_once_with("lxd", "6/stable")
+        assert (
+            problem == "service versions differ from the orchestrator: lxd 6.10 (orchestrator 6.9)"
+        )
+        stub._sessions.join_member.assert_not_called()
+
+    def test_waits_for_a_daemon_that_has_not_reported_a_version(self):
+        """A daemon that does not answer yet is waited for, not refreshed."""
+        stub = self._stub()
+
+        problem, _, install = self._reconcile(stub, versions={"lxd": "6.9"})
+
+        assert problem is None
+        install.assert_not_called()
+        assert stub.unit.status.message == (
+            "Waiting for the microcloud daemon(s) to report a version"
+        )
+        stub._relations.publish_member.assert_any_call(ANY, service_versions={"lxd": "6.9"})
+        stub._relations.publish_member.assert_any_call({}, ready=False)
+        stub._sessions.join_member.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("storage", "local", "ceph", "problem"),
+        [
+            (
+                ["local"],
+                "",
+                [],
+                "the cluster has a local pool; attach local storage or set local-device",
+            ),
+            ([], "/dev/sdb", [], "local storage attached but the cluster has no local pool"),
+            (
+                ["local"],
+                "/dev/sdb",
+                ["/dev/sdc"],
+                "ceph storage attached but the cluster has no Ceph pools",
+            ),
+            (["ceph", "local"], "/dev/sdb", ["/dev/sdc"], None),
+        ],
+    )
+    def test_storage_must_match_the_cluster_pools(self, storage, local, ceph, problem):
+        from cluster_relation import OrchestratorFacts
+
+        stub = self._stub(
+            facts=OrchestratorFacts(
+                snap_channels={"lxd": "6/stable"}, initialized=True, storage=storage
+            )
+        )
+        system = {**self._SYSTEM, "storage_local_path": local, "storage_ceph_paths": ceph}
+
+        assert self._reconcile(stub, system=system, versions={})[0] == problem
+
+    def test_excluded_after_repeated_failed_sessions(self):
+        from cluster_relation import JoinFailures, OrchestratorFacts
+
+        stub = self._stub(
+            facts=OrchestratorFacts(
+                snap_channels={"lxd": "6/stable"},
+                initialized=True,
+                storage=[],
+                failures=JoinFailures(3, "Error: boom", {"arm0": "sig"}),
+            )
+        )
+
+        assert self._reconcile(stub, versions={})[0] == (
+            "excluded after 3 failed join sessions: Error: boom"
+        )
+        # Still ready: a unit added after the exclusion changes the candidate
+        # set, which is what resets the count on the orchestrator.
+        stub._relations.publish_member.assert_any_call({}, ready=True)
+        stub._sessions.join_member.assert_not_called()
+
+    def test_a_failed_prerequisite_withdraws_ready(self):
+        stub = self._stub()
+
+        problem, _, _ = self._reconcile(stub, versions={"lxd": "6.10", "microcloud": "3.2"})
+
+        assert problem
+        stub._relations.publish_member.assert_any_call({}, ready=False)
+
+    def test_waits_for_the_cluster_storage_before_ready(self):
+        from cluster_relation import OrchestratorFacts
+
+        stub = self._stub(
+            facts=OrchestratorFacts(snap_channels={"lxd": "6/stable"}, initialized=True)
+        )
+        system = {**self._SYSTEM, "storage_local_path": "/dev/sdb"}
+
+        assert self._reconcile(stub, system=system, versions={})[0] is None
+        assert stub.unit.status.message == "Waiting for the cluster's storage pools"
+        stub._relations.publish_member.assert_any_call({}, ready=False)
+
+    def test_waits_for_the_leader_to_record_the_mode_before_ready(self):
+        stub = self._stub(mode="")
+
+        assert self._reconcile(stub)[0] is None
+        assert "record the cluster mode" in stub.unit.status.message
+        stub._sessions.join_member.assert_not_called()
+
+    def test_clustered_member_of_another_microcloud_blocks(self):
+        from charm import MicroCloudCharm
+        from cluster_relation import OrchestratorFacts
+
+        stub = self._stub(facts=OrchestratorFacts(fingerprint="aaaa"))
+        with (
+            patch("charm.lxd_cluster.is_clustered", return_value=True),
+            patch("charm.lxd_cluster.certificate_fingerprint", return_value="bbbb"),
+        ):
+            problem = MicroCloudCharm._reconcile_member_clustered(stub)
+
+        assert problem == "already a member of another MicroCloud"
+
+    def test_status_notes_a_removed_orchestrator_relation(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub(relation=False)
+        stub._is_orchestrator.return_value = False
+        stub._cos_related.return_value = False
+        stub.unit.is_leader.return_value = False
+
+        MicroCloudCharm._set_status(stub, initialized=True)
+
+        assert stub.unit.status.message == "Cluster ready; orchestrator relation removed"
+
+    def test_a_joined_member_application_checks_only_its_own_units(self):
+        from charm import MicroCloudCharm
+        from cluster import PeerSystem
+        from microcloud import Member
+
+        stub = self._stub(relation=False)
+        stub._relations.facts.return_value = None
+        stub.unit.is_leader.return_value = True
+        stub._coordinator.peer_systems.return_value = [
+            PeerSystem("arm0", "10.0.1.1", initialized=True)
+        ]
+        members = [Member("arm0", ""), Member("node0", "")]
+
+        with patch("charm.microcloud.list_members", return_value=members):
+            assert MicroCloudCharm._reconcile_member_clustered(stub) is None
+
+
+class TestPublishToMembers:
+    _CONFIGURED = {
+        "lxd": "6/stable",
+        "microceph": "tentacle/stable",
+        "microovn": "",
+        "microcloud": "3/stable",
+    }
+
+    def _stub(self, *, any_initialized=False, session=None):
+        from charm import MicroCloudCharm
+        from cluster_relation import ClusterRelation
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"session-timeout": 300}
+        stub._publish_facts.side_effect = lambda relations, initialized: (
+            MicroCloudCharm._publish_facts(stub, relations, initialized)
+        )
+        stub._snap_channels.return_value = dict(self._CONFIGURED)
+        stub._cluster_channels.side_effect = lambda initialized: MicroCloudCharm._cluster_channels(
+            stub, initialized
+        )
+        stub._coordinator = MagicMock()
+        stub._coordinator.any_initialized.return_value = any_initialized
+        stub._coordinator.session.return_value = session
+        stub._coordinator.joined_units.return_value = {}
+        stub._coordinator.grant_passphrase.return_value = {7: "secret:1"}
+        stub._relations = MagicMock(spec=ClusterRelation)
+        stub._relations.members_relations.return_value = [_relation("arm")]
+        return stub
+
+    def _publish(self, stub, initialized, *, tracked=None, versions=None, clustered=True):
+        from charm import MicroCloudCharm
+
+        with (
+            patch("charm.snap.tracked_channels", **(tracked or {"return_value": {}})),
+            patch(
+                "charm.snap.service_versions",
+                return_value=versions if versions is not None else {"lxd": "6.9"},
+            ) as service_versions,
+            patch("charm.lxd_cluster.is_clustered", return_value=clustered),
+            patch("charm.lxd_cluster.certificate_fingerprint", return_value="abcd"),
+            patch("charm.lxd_cluster.storage_pools", return_value=["local"]),
+        ):
+            MicroCloudCharm._publish_to_members(stub, initialized)
+        self.service_versions = service_versions
+        return stub._relations.publish_facts.call_args.kwargs
+
+    def test_before_the_cluster_forms_publishes_the_configured_channels(self):
+        versions = dict.fromkeys(["lxd", "microceph", "microcloud"], "1")
+
+        facts = self._publish(self._stub(), False, versions=versions)
+
+        assert facts["snap_channels"] == self._CONFIGURED
+        assert facts["service_versions"] == versions
+        assert facts["initialized"] is False
+
+    def test_a_clustered_leader_publishes_the_channels_its_snaps_track(self):
+        """A channel edited on a formed cluster must not reach new member units."""
+        tracked = {
+            "lxd": "6/stable",
+            "microceph": "squid/stable",
+            "microovn": "26.03/stable",
+            "microcloud": "",
+            "core24": "latest/stable",
+        }
+
+        facts = self._publish(self._stub(), True, tracked={"return_value": tracked})
+
+        assert facts["snap_channels"] == {
+            "lxd": "6/stable",
+            "microceph": "squid/stable",
+            "microovn": "26.03/stable",
+            "microcloud": "3/stable",
+        }
+
+    def test_a_snap_the_cluster_does_not_run_gets_no_channel(self):
+        tracked = {"lxd": "6/stable", "microcloud": "3/stable"}
+
+        facts = self._publish(self._stub(), True, tracked={"return_value": tracked})
+
+        assert facts["snap_channels"]["microceph"] == ""
+
+    def test_unreadable_channels_stay_as_published(self):
+        import snap
+
+        facts = self._publish(
+            self._stub(), True, tracked={"side_effect": snap.SnapError("no snapd")}
+        )
+
+        assert facts["snap_channels"] is None
+        assert facts["service_versions"] is None
+        self.service_versions.assert_not_called()
+
+    def test_an_unclustered_leader_keeps_what_the_cluster_published(self):
+        """Leadership can move to a unit that has not joined the cluster yet."""
+        facts = self._publish(self._stub(any_initialized=True), False)
+
+        assert facts["initialized"] is True
+        assert facts["snap_channels"] is None
+        assert facts["service_versions"] is None
+        assert facts["fingerprint"] is None
+        assert facts["storage"] is None
+        self.service_versions.assert_not_called()
+
+    def test_storage_pools_wait_for_the_session_to_end(self):
+        """During bootstrap LXD is clustered, but the pools do not exist yet."""
+        opened = session.JoinSession("abc", "10.0.0.1", ["node0"], 2000.0)
+
+        facts = self._publish(self._stub(session=opened), True)
+
+        assert facts["storage"] is None
+        assert facts["fingerprint"] == "abcd"
+
+    def test_storage_pools_are_published_with_no_session_open(self):
+        assert self._publish(self._stub(), True)["storage"] == ["local"]
+
+    def _reconcile_ending_session(self, *, sessions, problem=None):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.unit.is_leader.return_value = True
+        stub._coordinator = MagicMock()
+        stub._coordinator.session.side_effect = sessions
+        stub._sessions = MagicMock()
+        stub._sessions.pending.return_value = []
+        stub._sessions.has_member_candidates.return_value = False
+        stub._reconcile_deploy.return_value = problem
+        with patch("charm.microcloud.is_initialized", return_value=True):
+            result = MicroCloudCharm._reconcile_orchestrator(stub, False)
+        return stub, result
+
+    def test_the_hook_that_ends_a_session_publishes_again(self):
+        opened = session.JoinSession("abc", "10.0.0.1", ["node0"], 2000.0)
+
+        stub, result = self._reconcile_ending_session(sessions=[opened, opened, None])
+
+        assert result is True
+        assert [call.args for call in stub._publish_to_members.call_args_list] == [
+            (False,),
+            (True,),
+        ]
+
+    def test_a_blocked_session_end_still_publishes_again(self):
+        opened = session.JoinSession("abc", "10.0.0.1", ["node0"], 2000.0)
+
+        stub, result = self._reconcile_ending_session(
+            sessions=[opened, opened, None], problem="Join session failed: boom"
+        )
+
+        assert result is False
+        assert stub._publish_to_members.call_count == 2
+
+    def test_a_session_still_open_is_not_published_again(self):
+        opened = session.JoinSession("abc", "10.0.0.1", ["node0"], 2000.0)
+
+        stub, _ = self._reconcile_ending_session(sessions=[opened, opened, opened])
+
+        stub._publish_to_members.assert_called_once_with(False)
+
+    def test_the_secret_id_is_published_only_where_it_was_granted(self):
+        stub = self._stub()
+        assert self._publish(stub, True)["secret_id"] == "secret:1"
+
+        stub = self._stub()
+        stub._coordinator.grant_passphrase.return_value = {}
+        assert self._publish(stub, True)["secret_id"] is None
+
+    def test_a_partial_version_set_is_not_published(self):
+        tracked = {"lxd": "6/stable", "microcloud": "3/stable"}
+
+        facts = self._publish(self._stub(), True, tracked={"return_value": tracked})
+
+        assert facts["service_versions"] is None
+
+
+class TestMembershipAcrossApplications:
+    def _validate(self, member, *, cluster="aaaa", names=("node0",)):
+        from charm import MicroCloudCharm
+        from cluster_relation import ClusterRelation
+        from microcloud import Member
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.unit.is_leader.return_value = True
+        stub._coordinator = MagicMock()
+        stub._coordinator.all_members.return_value = [("node0", "10.0.0.1")]
+        stub._coordinator.joined_units.return_value = {}
+        stub._relations = MagicMock(spec=ClusterRelation)
+        stub._relations.members_relations.return_value = [_relation("arm")]
+        stub._relations.member_systems.return_value = [member]
+        stub._relations.published_fingerprint.return_value = cluster
+        with patch(
+            "charm.microcloud.list_members", return_value=[Member(name, "") for name in names]
+        ):
+            return MicroCloudCharm._reconcile_observe_only(stub)
+
+    @staticmethod
+    def _member(fingerprint):
+        from cluster import PeerSystem
+        from cluster_relation import MemberSystem
+
+        return MemberSystem(
+            "arm/0",
+            PeerSystem("arm0", "10.0.1.1", initialized=True),
+            fingerprint=fingerprint,
+        )
+
+    def test_a_member_unit_clustered_elsewhere_does_not_block_the_leader(self):
+        assert self._validate(self._member("bbbb")) is None
+
+    def test_a_member_unit_of_this_cluster_that_left_it_blocks_the_leader(self):
+        assert self._validate(self._member("aaaa")) == (
+            "Juju unit on 'arm0' is not a MicroCloud member"
+        )
+
+    def test_a_member_unit_with_no_fingerprint_yet_is_still_expected(self):
+        assert self._validate(self._member("")) == (
+            "Juju unit on 'arm0' is not a MicroCloud member"
+        )
+
+    def test_a_joined_member_unit_is_fine(self):
+        assert self._validate(self._member("aaaa"), names=("node0", "arm0")) is None
+
+
+class TestJoinedUnits:
+    def _publish(self, *, relations, joined, initialized=True):
+        from charm import MicroCloudCharm
+        from cluster_relation import ClusterRelation
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._coordinator = MagicMock()
+        stub._coordinator.joined_units.return_value = joined
+        stub._relations = MagicMock(spec=ClusterRelation)
+        stub._relations.members_relations.return_value = relations
+        MicroCloudCharm._publish_to_members(stub, initialized)
+        return stub
+
+    def test_kept_in_sync_after_the_last_relation_is_gone(self):
+        stub = self._publish(relations=[], joined={"arm0": "arm/0"})
+
+        stub._sync_joined_units.assert_called_once_with([])
+        stub._publish_facts.assert_not_called()
+
+    def test_a_standalone_application_does_not_read_the_members(self):
+        stub = self._publish(relations=[], joined={})
+
+        stub._sync_joined_units.assert_not_called()
+
+    def test_not_synced_by_an_unclustered_leader(self):
+        stub = self._publish(relations=[], joined={"arm0": "arm/0"}, initialized=False)
+
+        stub._sync_joined_units.assert_not_called()
+
+    def test_a_removed_member_of_a_detached_application_is_dropped(self):
+        from charm import MicroCloudCharm
+        from microcloud import Member
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._coordinator = MagicMock()
+        stub._coordinator.joined_units.return_value = {"arm0": "arm/0", "arm1": "arm/1"}
+
+        with patch("charm.microcloud.list_members", return_value=[Member("arm1", "")]):
+            MicroCloudCharm._sync_joined_units(stub, [])
+
+        stub._coordinator.record_joined_units.assert_called_once_with({"arm1": "arm/1"})
+
+    def test_drops_scaled_down_units_and_keeps_detached_applications(self):
+        from charm import MicroCloudCharm
+        from cluster import PeerSystem
+        from cluster_relation import ClusterRelation, MemberSystem
+        from microcloud import Member
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._coordinator = MagicMock()
+        stub._coordinator.joined_units.return_value = {
+            "arm0": "arm/0",
+            "arm1": "arm/1",
+            "gpu0": "gpu/0",
+            "gone": "arm/9",
+        }
+        stub._relations = MagicMock(spec=ClusterRelation)
+        stub._relations.member_systems.return_value = [
+            MemberSystem("arm/2", PeerSystem("arm2", "10.0.1.3"))
+        ]
+        stub._relations.member_units.return_value = ["arm/0", "arm/2"]
+        members = [Member(name, "") for name in ("node0", "arm0", "arm1", "arm2", "gpu0")]
+
+        with patch("charm.microcloud.list_members", return_value=members):
+            MicroCloudCharm._sync_joined_units(stub, [_relation("arm")])
+
+        stub._coordinator.record_joined_units.assert_called_once_with(
+            {"arm0": "arm/0", "arm2": "arm/2", "gpu0": "gpu/0"}
+        )
