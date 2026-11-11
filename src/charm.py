@@ -65,6 +65,7 @@ from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
 import lxd_cluster
 import microcloud
+import microovn
 import session
 import snap
 import storage_health
@@ -329,7 +330,7 @@ class MicroCloudCharm(ops.CharmBase):
                     # Not while a join is in flight: MicroCloud adds the disks
                     # and creates the pools after the systems have joined.
                     if not problem and not pending and self._coordinator.session() is None:
-                        problem = self._storage_problem()
+                        problem = self._storage_problem() or self._ovn_problem()
                 else:
                     problem = self._await_lxd_join()
 
@@ -522,6 +523,18 @@ class MicroCloudCharm(ops.CharmBase):
         if found:
             return "Cluster formed without storage: " + "; ".join(found)
         return None
+
+    def _ovn_problem(self) -> str | None:
+        """Return a problem if MicroOVN is configured but not in the cluster, or None.
+
+        MicroCloud forms the cluster without a service it cannot find on a
+        system, and reports the result as formed.
+        """
+        if not self.config.get("snap-channel-microovn", ""):
+            return None
+        if microovn.is_initialized():
+            return None
+        return f"Cluster formed without MicroOVN on {microcloud.hostname()}"
 
     # ---- Observe-only mode ----
 

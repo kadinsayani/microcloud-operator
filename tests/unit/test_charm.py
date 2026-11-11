@@ -786,6 +786,32 @@ class TestStorageProblem:
         assert problem == "Cannot check the storage of node1: microceph is down"
 
 
+class TestOVNProblem:
+    def _check(self, *, channel, initialized):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"snap-channel-microovn": channel}
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microovn.is_initialized", return_value=initialized) as is_initialized,
+        ):
+            return MicroCloudCharm._ovn_problem(stub), is_initialized
+
+    def test_microovn_is_not_expected_without_a_channel(self):
+        problem, is_initialized = self._check(channel="", initialized=False)
+        assert problem is None
+        is_initialized.assert_not_called()
+
+    def test_microovn_in_the_cluster_is_no_problem(self):
+        problem, _ = self._check(channel="24.03/stable", initialized=True)
+        assert problem is None
+
+    def test_microovn_left_out_of_the_cluster_is_reported(self):
+        problem, _ = self._check(channel="24.03/stable", initialized=False)
+        assert problem == "Cluster formed without MicroOVN on node1"
+
+
 class TestMicroOVNWrappers:
     def _run(self, **kwargs):
         import microovn
@@ -2339,6 +2365,19 @@ class TestFailureDomains:
         self._reconcile(stub, session=session)
 
         stub._storage_problem.assert_not_called()
+        stub._ovn_problem.assert_not_called()
+
+    def test_a_clustered_unit_missing_microovn_blocks(self):
+        import ops
+
+        stub = self._stub()
+        stub._sessions.pending.return_value = []
+        stub._storage_problem.return_value = None
+        stub._ovn_problem.return_value = "Cluster formed without MicroOVN on node1"
+
+        self._reconcile(stub, session=None)
+
+        assert stub.unit.status == ops.BlockedStatus("Cluster formed without MicroOVN on node1")
 
     @pytest.mark.parametrize("initialized", [True, False])
     def test_only_a_unit_clustered_when_the_hook_starts_sets_its_failure_domain(self, initialized):
