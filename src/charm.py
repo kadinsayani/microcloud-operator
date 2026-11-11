@@ -53,6 +53,7 @@ logging-relation-broken
     • Disable LXD's Loki streaming again.
 """
 
+import ipaddress
 import json
 import logging
 import platform
@@ -525,16 +526,31 @@ class MicroCloudCharm(ops.CharmBase):
         return None
 
     def _ovn_problem(self) -> str | None:
-        """Return a problem if MicroOVN is configured but not in the cluster, or None.
+        """Return what the cluster lacks of this unit's MicroOVN setup, or None.
 
         MicroCloud forms the cluster without a service it cannot find on a
-        system, and reports the result as formed.
+        system, and without an underlay address it was given when it sets up
+        no uplink network. It reports both results as formed.
         """
         if not self.config.get("snap-channel-microovn", ""):
             return None
-        if microovn.is_initialized():
+
+        hostname = microcloud.hostname()
+        if not microovn.is_initialized():
+            return f"Cluster formed without MicroOVN on {hostname}"
+
+        underlay = self._network.space_bind_address("ovn-underlay")
+        if not underlay:
             return None
-        return f"Cluster formed without MicroOVN on {microcloud.hostname()}"
+        try:
+            tunnels = microovn.tunnel_addresses()
+        except microovn.MicroOVNError as exc:
+            return f"Cannot check the OVN tunnels of {hostname}: {exc}"
+
+        if tunnels != [ipaddress.ip_address(underlay)]:
+            used = ", ".join(str(address) for address in tunnels)
+            return f"OVN tunnels on {hostname} use {used}, not the underlay address {underlay}"
+        return None
 
     # ---- Observe-only mode ----
 

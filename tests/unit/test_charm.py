@@ -787,14 +787,26 @@ class TestStorageProblem:
 
 
 class TestOVNProblem:
-    def _check(self, *, channel, initialized):
+    def _check(
+        self, *, channel="24.03/stable", initialized=True, underlay="", tunnels=(), error=None
+    ):
+        import ipaddress
+
         from charm import MicroCloudCharm
+        from network import UnitNetwork
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub.config = {"snap-channel-microovn": channel}
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.space_bind_address.return_value = underlay
         with (
             patch("charm.microcloud.hostname", return_value="node1"),
             patch("charm.microovn.is_initialized", return_value=initialized) as is_initialized,
+            patch(
+                "charm.microovn.tunnel_addresses",
+                return_value=[ipaddress.ip_address(address) for address in tunnels],
+                side_effect=error,
+            ) as self.tunnel_addresses,
         ):
             return MicroCloudCharm._ovn_problem(stub), is_initialized
 
@@ -804,12 +816,34 @@ class TestOVNProblem:
         is_initialized.assert_not_called()
 
     def test_microovn_in_the_cluster_is_no_problem(self):
-        problem, _ = self._check(channel="24.03/stable", initialized=True)
+        problem, _ = self._check()
         assert problem is None
 
     def test_microovn_left_out_of_the_cluster_is_reported(self):
-        problem, _ = self._check(channel="24.03/stable", initialized=False)
+        problem, _ = self._check(initialized=False)
         assert problem == "Cluster formed without MicroOVN on node1"
+
+    def test_tunnels_are_not_checked_without_an_underlay_address(self):
+        problem, _ = self._check(tunnels=["10.0.0.1"])
+        assert problem is None
+        self.tunnel_addresses.assert_not_called()
+
+    def test_tunnels_on_the_underlay_address_are_no_problem(self):
+        """The two sides may spell an IPv6 address differently."""
+        problem, _ = self._check(underlay="fd00:1::0:5", tunnels=["fd00:1::5"])
+        assert problem is None
+
+    def test_tunnels_on_another_address_are_reported(self):
+        problem, _ = self._check(underlay="fd00:1::5", tunnels=["fd00:2::5"])
+        assert problem == "OVN tunnels on node1 use fd00:2::5, not the underlay address fd00:1::5"
+
+    def test_tunnels_that_cannot_be_read_are_reported(self):
+        import microovn
+
+        problem, _ = self._check(
+            underlay="fd00:1::5", error=microovn.MicroOVNError("ovs-vsctl: no socket")
+        )
+        assert problem == "Cannot check the OVN tunnels of node1: ovs-vsctl: no socket"
 
 
 class TestMicroOVNWrappers:
@@ -832,6 +866,39 @@ class TestMicroOVNWrappers:
     def test_a_missing_snap_means_not_initialized(self):
         initialized, _ = self._run(side_effect=FileNotFoundError("microovn"))
         assert initialized is False
+
+    def _tunnels(self, **kwargs):
+        import microovn
+
+        with patch("microovn.subprocess.run", **kwargs):
+            return microovn.tunnel_addresses()
+
+    def test_tunnel_addresses_come_from_open_vswitch(self):
+        import ipaddress
+
+        tunnels = self._tunnels(return_value=MagicMock(stdout='"fd00:1::5"\n'))
+        assert tunnels == [ipaddress.ip_address("fd00:1::5")]
+
+    def test_several_tunnel_addresses_are_all_returned(self):
+        import ipaddress
+
+        tunnels = self._tunnels(return_value=MagicMock(stdout='"10.0.0.1,fd00:1::5"\n'))
+        assert tunnels == [ipaddress.ip_address("10.0.0.1"), ipaddress.ip_address("fd00:1::5")]
+
+    def test_a_failing_open_vswitch_raises(self):
+        import subprocess
+
+        import microovn
+
+        failure = subprocess.CalledProcessError(1, "ovs-vsctl", stderr="no socket\n")
+        with pytest.raises(microovn.MicroOVNError, match="no socket"):
+            self._tunnels(side_effect=failure)
+
+    def test_an_unset_tunnel_address_raises(self):
+        import microovn
+
+        with pytest.raises(microovn.MicroOVNError, match="Invalid tunnel address"):
+            self._tunnels(return_value=MagicMock(stdout="\n"))
 
 
 # ---------------------------------------------------------------------------
