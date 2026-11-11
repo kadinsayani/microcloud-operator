@@ -786,6 +786,28 @@ class TestStorageProblem:
         assert problem == "Cannot check the storage of node1: microceph is down"
 
 
+class TestMicroOVNWrappers:
+    def _run(self, **kwargs):
+        import microovn
+
+        with patch("microovn.subprocess.run", **kwargs) as run:
+            return microovn.is_initialized(), run
+
+    def test_a_listed_cluster_means_initialized(self):
+        initialized, run = self._run(return_value=MagicMock(returncode=0))
+        assert initialized is True
+        assert run.call_args.args[0] == ["microovn", "cluster", "list"]
+
+    def test_a_failing_command_means_not_initialized(self):
+        """Both a stopped daemon and an uninitialized one fail the command."""
+        initialized, _ = self._run(return_value=MagicMock(returncode=1))
+        assert initialized is False
+
+    def test_a_missing_snap_means_not_initialized(self):
+        initialized, _ = self._run(side_effect=FileNotFoundError("microovn"))
+        assert initialized is False
+
+
 # ---------------------------------------------------------------------------
 # microcloud CLI wrappers
 # ---------------------------------------------------------------------------
