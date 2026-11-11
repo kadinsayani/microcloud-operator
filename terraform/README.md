@@ -145,6 +145,39 @@ useful on MAAS: it keeps units on machines that have a NIC on the right fabric.
 MicroCloud rejects a Ceph public or internal network without Ceph storage, so
 the charm leaves them out otherwise, even when the bindings resolve.
 
+**A network with no interface on the machines takes a config option, not a
+binding.** Where hosts keep their Ceph and OVN addresses on `lo` and advertise
+them over BGP, MAAS has no interface in those spaces, and a deploy that binds an
+endpoint to one fails with `No available machine matches constraints`. Leave
+`ceph-public`, `ceph-internal` and `ovn-underlay` unbound and set the IPv6 /64
+of each network instead:
+
+```hcl
+endpoint_bindings = [
+  { space = "management" },
+]
+
+config = {
+  "ceph-public-network"   = "2001:db8:0:3::/64"
+  "ceph-internal-network" = "2001:db8:0:4::/64"
+  "ovn-underlay-network"  = "2001:db8:0:1::/64"
+}
+```
+
+Each unit's address in a network is that /64 with the host part of the unit's
+cluster address: a unit at `2001:db8:0:2::15` uses `2001:db8:0:3::15` on the
+Ceph public network. The cluster address must be IPv6. Keep four things in mind:
+1. The charm adds the addresses to `lo` and keeps them in
+   `/etc/netplan/90-microcloud-lo.yaml`. It does not advertise them: the routing
+   daemon on the machine has to export what is on `lo`.
+2. A unit stays in `Waiting for <peer> to answer on <address>` until every peer
+   answers on its derived addresses, so the cluster forms only once routing
+   works in both directions.
+3. A unit blocks if its machine already holds another address in one of the
+   networks.
+4. MicroCloud applies the OVN underlay address only when `ovn-uplink-interface`
+   names an interface. Without one, the OVN tunnels use the cluster address.
+
 **`machines` sets the unit count.** With `machines`, the unit count is the
 number of machines. `units` must then be left at its default of 1 or match
 it; any other value fails validation rather than being dropped.
