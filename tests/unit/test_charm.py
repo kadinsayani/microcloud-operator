@@ -1253,6 +1253,7 @@ class TestGrowCharm:
 
         with (
             patch("charm.snap.ensure_snaps") as ensure_snaps,
+            patch("charm.snap.start") as self.snap_start,
             patch("charm.microcloud.waitready", return_value=True),
         ):
             problem = MicroCloudCharm._reconcile_deploy(stub, initialized, pending)
@@ -1300,6 +1301,52 @@ class TestGrowCharm:
         assert problem is None
         ensure_snaps.assert_not_called()
         stub._sessions.lead.assert_called_once_with(True, pending, "secret")
+
+    def test_the_microovn_daemon_is_started_with_microovn(self):
+        """A snap installed earlier for its BGP daemon may have this one disabled."""
+        stub = self._stub(leader=True)
+        stub.config = {"snap-channel-microovn": "24.03/stable"}
+
+        problem, _ = self._deploy(stub, initialized=False, pending=[])
+
+        assert problem is None
+        self.snap_start.assert_called_once_with("microovn.daemon")
+
+    def test_the_microovn_daemon_is_not_started_without_microovn(self):
+        stub = self._stub(leader=True)
+        stub.config = {"snap-channel-microovn": ""}
+
+        problem, _ = self._deploy(stub, initialized=False, pending=[])
+
+        assert problem is None
+        self.snap_start.assert_not_called()
+
+    def test_a_microovn_daemon_that_cannot_start_blocks_the_deploy(self):
+        import snap
+
+        stub = self._stub(leader=True)
+        stub.config = {"snap-channel-microovn": "24.03/stable"}
+
+        from charm import MicroCloudCharm
+
+        with (
+            patch("charm.snap.ensure_snaps"),
+            patch("charm.snap.start", side_effect=snap.SnapError("no such service")),
+            patch("charm.microcloud.waitready", return_value=True),
+        ):
+            problem = MicroCloudCharm._reconcile_deploy(stub, False, [])
+
+        assert problem == "Snap install: no such service"
+        stub._sessions.lead.assert_not_called()
+
+    def test_a_clustered_leader_leaves_the_microovn_daemon_alone(self):
+        stub = self._stub(leader=True)
+        stub.config = {"snap-channel-microovn": "24.03/stable"}
+
+        problem, _ = self._deploy(stub, initialized=True, pending=[])
+
+        assert problem is None
+        self.snap_start.assert_not_called()
 
     def test_unclustered_joiner_installs_snaps_and_joins(self):
         stub = self._stub(leader=False)

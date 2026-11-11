@@ -414,6 +414,12 @@ class MicroCloudCharm(ops.CharmBase):
             }
             try:
                 snap.ensure_snaps(channels)
+                # The MicroOVN snap may already be there with its daemon
+                # disabled, installed for the BGP daemon it ships. MicroCloud
+                # leaves out a service whose daemon it cannot find, and forms
+                # the cluster without it.
+                if channels["microovn"]:
+                    snap.start(snap.MICROOVN_DAEMON)
             except snap.SnapError as exc:
                 return f"Snap install: {exc}"
 
