@@ -417,6 +417,13 @@ class TestSnap:
                     ["snap", "install", "lxd", "--channel", "6/stable", "--cohort=+"]
                 )
 
+    def test_start_also_enables_the_service(self):
+        import snap
+
+        with patch("snap._run") as mock_run:
+            snap.start("microovn.daemon")
+            mock_run.assert_called_once_with(["snap", "start", "--enable", "microovn.daemon"])
+
     def test_install_refreshes_when_present(self):
         import snap
 

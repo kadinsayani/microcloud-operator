@@ -13,6 +13,9 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 
+# The service MicroCloud talks to when it sets up MicroOVN.
+MICROOVN_DAEMON = "microovn.daemon"
+
 
 class SnapError(Exception):
     """Raised when a snap operation fails."""
@@ -58,6 +61,15 @@ def hold(name: str) -> None:
         _run(["snap", "refresh", "--hold", name])
     except SnapError as exc:
         logger.warning("Cannot hold refreshes for snap %s: %s", name, exc)
+
+
+def start(service: str) -> None:
+    """Start ``service`` and have it start on boot.
+
+    A snap that was on the machine before the charm may have services that
+    whoever installed it disabled, and a refresh leaves them disabled.
+    """
+    _run(["snap", "start", "--enable", service])
 
 
 def ensure_snaps(channels: dict[str, str]) -> None:
