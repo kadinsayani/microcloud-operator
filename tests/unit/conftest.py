@@ -5,15 +5,19 @@ from unittest.mock import patch
 
 import pytest
 
-import bgp
+import network
 
 
 @pytest.fixture(autouse=True)
-def _no_microovn_snap():
-    """Keep unit tests from asking the real machine for the MicroOVN snap.
+def _no_host_network():
+    """Keep unit tests from reading or changing the real machine's network.
 
-    The charm checks for it on every reconcile; a test that needs it
-    installed patches bgp.installed itself.
+    The charm reads the machine's addresses and looks for an older release's
+    files on every reconcile; a test that needs addresses patches
+    network.host_addresses itself.
     """
-    with patch.object(bgp, "installed", return_value=False):
+    with (
+        patch.object(network, "host_addresses", return_value={}),
+        patch.object(network, "remove_legacy_files"),
+    ):
         yield

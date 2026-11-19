@@ -42,6 +42,25 @@ Replacing a role holder:
 
 Replace a failure domain's last member before removing it. The leader only checks failure domains that still have members.
 
+## Networks with no interface on the machines
+
+On a fabric where each machine reaches the Ceph or OVN underlay networks only through routing, the machines have no interface in those networks. The machine's deployment puts the machine's address in each such network on `lo` and advertises it, for example over BGP. Juju can't place a unit on a machine with no interface in a bound space, so give the charm these networks as options and leave their endpoints out of `--bind`:
+
+```sh
+juju config microcloud \
+  ceph-public-network=fd00:0:0:400::/64 \
+  ceph-internal-network=fd00:0:0:300::/64 \
+  ovn-underlay-network=fd00:0:0:1::/64
+```
+
+A Ceph option can also be a /56 pool, whose first /64 is used. Each unit's address in a network is the one address on `lo` inside that /64. The charm writes no addresses or routes:
+
+* A unit waits until the address is on `lo`.
+* A unit blocks if its machine has more than one address in the /64, or has it on an interface other than `lo`, or if another unit has the same address.
+* Before a unit joins the cluster, it waits until each peer answers a ping on its addresses, which shows that the routes work in both directions.
+
+Earlier releases of the charm put these addresses on `lo` themselves, in `/etc/netplan/90-microcloud-lo.yaml`. The charm removes that file once another netplan file holds the same addresses, and it applies nothing, so the addresses stay in place.
+
 ## NUMA-steered Ceph OSDs
 
 On a host with a network card on each NUMA node, each Ceph OSD can keep its traffic on the card attached to its disk's NUMA node. The machine's deployment does the networking: for each NUMA node and Ceph network, it puts one address on `lo`, inside a /64 that belongs to that node, and routes it through that node's card. Those addresses have a preferred lifetime of 0, so the kernel never picks them as a source address on its own. The charm manages no addresses or routes for this. It only binds the OSDs.

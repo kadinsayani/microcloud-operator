@@ -38,7 +38,6 @@ from typing import Any
 
 import ops
 
-import bgp
 import microcloud
 import snap
 from cluster import ClusterCoordinator, JoinSession, PeerSystem
@@ -379,9 +378,7 @@ class JoinSessions:
             ceph_internal_network=self._network.space_cidr("ceph-internal")
             if with_ceph_storage
             else "",
-            # With BGP uplinks the MicroOVN snap is there for BIRD only.
-            with_ovn=bool(self._config.get("snap-channel-microovn", ""))
-            and not bgp.uplinks(str(self._config.get("bgp-uplinks", ""))),
+            with_ovn=bool(self._config.get("snap-channel-microovn", "")),
             ovn_ipv4_gateway=self._config.get("ovn-ipv4-gateway", ""),
             ovn_ipv4_range=self._config.get("ovn-ipv4-range", ""),
             ovn_ipv6_gateway=self._config.get("ovn-ipv6-gateway", ""),

@@ -63,10 +63,9 @@ import ops
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
-import bgp
-import loopback
 import lxd_cluster
 import microcloud
+import network
 import session
 import snap
 import steering
@@ -285,18 +284,18 @@ class MicroCloudCharm(ops.CharmBase):
 
         # Before anything names these addresses: MicroCloud looks for them on
         # the host when it reads the preseed.
-        derived = self._network.derived_addresses()
-        problem = loopback.ensure(derived)
+        try:
+            network.remove_legacy_files()
+            problem, waiting = self._network.lo_problem()
+        except network.HostNetworkError as exc:
+            problem, waiting = f"Cannot read this machine's addresses: {exc}", None
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
             return
-
-        # On every hook once the snap is in: keeps BIRD alone and up to date.
-        if bgp.installed():
-            problem = self._ensure_bgp()
-            if problem:
-                self.unit.status = ops.BlockedStatus(problem)
-                return
+        if waiting:
+            self.unit.status = ops.WaitingStatus(waiting)
+            return
+        on_lo = self._network.lo_addresses()
 
         storage_ceph_paths, problem = self._storage_ceph_paths()
         if problem:
@@ -313,9 +312,7 @@ class MicroCloudCharm(ops.CharmBase):
             ovn_underlay_ip=self._network.space_address("ovn-underlay"),
             storage_local_path=self._storage_local_path(),
             storage_ceph_paths=storage_ceph_paths,
-            loopback_addresses={
-                str(network): str(address) for network, address in derived.items()
-            },
+            loopback_addresses={str(net): str(address) for net, address in on_lo.items()},
             initialized=initialized,
         )
 
@@ -455,11 +452,6 @@ class MicroCloudCharm(ops.CharmBase):
             except snap.SnapError as exc:
                 return f"Snap install: {exc}"
 
-            # Before MicroCloud can see a running MicroOVN daemon.
-            problem = self._ensure_bgp()
-            if problem:
-                return problem
-
         if not microcloud.waitready(timeout=60):
             self._hold_status(ops.WaitingStatus("Waiting for microcloud daemon"))
             return None
@@ -467,7 +459,7 @@ class MicroCloudCharm(ops.CharmBase):
         # Only where the uplink is actually used: with MicroOVN disabled the
         # interface name never reaches the preseed, and a stale value left in
         # the config must not stop the cluster forming.
-        if self.config.get("snap-channel-microovn", "") and not self._bgp_uplinks():
+        if self.config.get("snap-channel-microovn", ""):
             interface, _ = self._network.ovn_uplink_interface()
             problem = self._network.missing_uplink_interface(interface)
             if problem:
@@ -482,8 +474,12 @@ class MicroCloudCharm(ops.CharmBase):
             self._hold_status(ops.WaitingStatus("Waiting for session passphrase"))
             return None
 
+        problem = self._shared_address()
+        if problem:
+            return problem
+
         # A unit that is not clustered yet waits until its peers answer on
-        # their derived addresses: until those are advertised both ways, a
+        # their addresses on "lo": until those are advertised both ways, a
         # join session would start Ceph or OVN on addresses nothing can reach.
         if not initialized and not self._coordinator.published_ready():
             waiting = self._unreachable_peer()
@@ -499,38 +495,29 @@ class MicroCloudCharm(ops.CharmBase):
             return self._sessions.lead(initialized, pending, passphrase or "")
         return self._sessions.join(passphrase or "")
 
-    def _bgp_uplinks(self) -> list[str]:
-        return bgp.uplinks(str(self.config.get("bgp-uplinks", "")))
+    def _shared_address(self) -> str | None:
+        """Return a problem if a peer has one of this unit's addresses on "lo", or None.
 
-    def _ensure_bgp(self) -> str | None:
-        """Advertise this unit's derived addresses over BGP, if asked to.
-
-        Returns a problem to block on, or None.
+        The machine's deployment derives them from each machine's management
+        address, so two machines whose host parts match get the same ones.
+        Both units block.
         """
-        interfaces = self._bgp_uplinks()
-        if not interfaces:
-            return None
-        if not self.config.get("snap-channel-microovn", ""):
-            return "bgp-uplinks needs snap-channel-microovn for BIRD"
-        derived = self._network.derived_addresses()
-        if not derived:
-            return "bgp-uplinks needs a network option and an IPv6 cluster address"
-        try:
-            router_id, asn = bgp.identity(next(iter(derived.values())))
-        except ValueError as exc:
-            return str(exc)
-        return bgp.ensure(bgp.render(router_id, asn, interfaces, derived.keys()))
+        own = {str(address) for address in self._network.lo_addresses().values()}
+        hostname = microcloud.hostname()
+        for system in sorted(self._coordinator.all_systems(), key=lambda peer: peer.name):
+            if system.name == hostname:
+                continue
+            for address in sorted(own & set(system.loopback_addresses.values())):
+                return f"{address} on lo is also on {system.name}"
+        return None
 
     def _unreachable_peer(self) -> str | None:
-        """Return which peer does not answer on a derived address yet, or None.
+        """Return which peer does not answer on its address on "lo" yet, or None.
 
-        Each peer is pinged on its address in every network this unit has a
-        derived address in, from that address.
+        Each peer is pinged on its address in every network this unit has an
+        address on "lo" in, from that address.
         """
-        own = {
-            str(network): str(address)
-            for network, address in self._network.derived_addresses().items()
-        }
+        own = {str(net): str(address) for net, address in self._network.lo_addresses().items()}
         if not own:
             return None
 
@@ -542,7 +529,7 @@ class MicroCloudCharm(ops.CharmBase):
                 continue
             for cidr, target in sorted(system.loopback_addresses.items()):
                 source = own.get(cidr)
-                if source and not loopback.reachable(source, target):
+                if source and not network.reachable(source, target):
                     return f"Waiting for {system.name} to answer on {target}"
         return None
 
@@ -617,7 +604,7 @@ class MicroCloudCharm(ops.CharmBase):
 
         try:
             steered, problem = steering.steered_addresses(
-                maps, loopback.host_addresses().get("lo", set())
+                maps, self._network.host_addresses().get("lo", set())
             )
             if problem:
                 return problem
@@ -674,7 +661,7 @@ class MicroCloudCharm(ops.CharmBase):
                     change.set,
                     f", without {', '.join(change.remove)}" if change.remove else "",
                 )
-        except (steering.SteeringError, loopback.LoopbackError) as exc:
+        except (steering.SteeringError, network.HostNetworkError) as exc:
             return f"Cannot steer the Ceph OSDs: {exc}"
         return None
 

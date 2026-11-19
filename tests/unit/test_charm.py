@@ -664,7 +664,7 @@ class TestUnreachablePeer:
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub._network = MagicMock(spec=UnitNetwork)
-        stub._network.derived_addresses.return_value = {
+        stub._network.lo_addresses.return_value = {
             ipaddress.IPv6Network(network): ipaddress.IPv6Address(address)
             for network, address in derived.items()
         }
@@ -672,7 +672,7 @@ class TestUnreachablePeer:
         stub._coordinator.all_systems.return_value = systems
         with (
             patch("charm.microcloud.hostname", return_value="node0"),
-            patch("charm.loopback.reachable", return_value=answers) as reachable,
+            patch("charm.network.reachable", return_value=answers) as reachable,
         ):
             return MicroCloudCharm._unreachable_peer(stub), reachable
 
@@ -681,7 +681,7 @@ class TestUnreachablePeer:
 
         return PeerSystem(name=name, address="fd00:2::9", loopback_addresses=addresses)
 
-    def test_nothing_to_wait_for_without_derived_addresses(self):
+    def test_nothing_to_wait_for_without_addresses_on_lo(self):
         waiting, reachable = self._check({}, [self._system("node1", {self.NETWORK: "fd00:3::2"})])
         assert waiting is None
         reachable.assert_not_called()
@@ -712,6 +712,42 @@ class TestUnreachablePeer:
         systems = [self._system("node1", {self.NETWORK: "fd00:3::2"})]
         waiting, _ = self._check({self.NETWORK: "fd00:3::1"}, systems, answers=False)
         assert waiting == "Waiting for node1 to answer on fd00:3::2"
+
+
+class TestSharedAddress:
+    def _check(self, own, systems):
+        import ipaddress
+
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.lo_addresses.return_value = {
+            ipaddress.IPv6Network(net): ipaddress.IPv6Address(address)
+            for net, address in own.items()
+        }
+        stub._coordinator = MagicMock()
+        stub._coordinator.all_systems.return_value = systems
+        with patch("charm.microcloud.hostname", return_value="node0"):
+            return MicroCloudCharm._shared_address(stub)
+
+    def _system(self, name, addresses):
+        from cluster import PeerSystem
+
+        return PeerSystem(name=name, address="fd00:2::9", loopback_addresses=addresses)
+
+    def test_a_peer_with_the_same_address_blocks(self):
+        systems = [
+            self._system("node0", {"fd00:3::/64": "fd00:3::1"}),
+            self._system("node2", {"fd00:3::/64": "fd00:3::1"}),
+            self._system("node1", {"fd00:3::/64": "fd00:3::1"}),
+        ]
+        problem = self._check({"fd00:3::/64": "fd00:3::1"}, systems)
+        assert problem == "fd00:3::1 on lo is also on node1"
+
+    def test_different_addresses_are_fine(self):
+        systems = [self._system("node1", {"fd00:3::/64": "fd00:3::2"})]
+        assert self._check({"fd00:3::/64": "fd00:3::1"}, systems) is None
 
 
 # ---------------------------------------------------------------------------
@@ -769,58 +805,6 @@ class TestPreseedInputs:
         sessions = self._sessions(config={"snap-channel-microovn": "latest/edge"}, cidrs={})
 
         assert sessions._preseed_inputs("10.0.0.1", "secret", []).with_ovn is True
-
-    def test_ovn_is_left_out_with_bgp_uplinks(self):
-        sessions = self._sessions(
-            config={"snap-channel-microovn": "latest/edge", "bgp-uplinks": "eth1,eth2"},
-            cidrs={},
-        )
-
-        assert sessions._preseed_inputs("10.0.0.1", "secret", []).with_ovn is False
-
-
-class TestEnsureBGP:
-    def _stub(self, config: dict, derived: dict):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = config
-        stub._network = MagicMock(spec=UnitNetwork)
-        stub._network.derived_addresses.return_value = derived
-        stub._bgp_uplinks.side_effect = lambda: MicroCloudCharm._bgp_uplinks(stub)
-        return stub
-
-    def test_nothing_to_do_without_uplinks(self):
-        from charm import MicroCloudCharm
-
-        stub = self._stub({}, {})
-        with patch("charm.bgp.ensure") as ensure:
-            assert MicroCloudCharm._ensure_bgp(stub) is None
-        ensure.assert_not_called()
-
-    def test_uplinks_need_a_microovn_channel(self):
-        from charm import MicroCloudCharm
-
-        stub = self._stub({"bgp-uplinks": "eth1"}, {})
-        assert "snap-channel-microovn" in MicroCloudCharm._ensure_bgp(stub)
-
-    def test_renders_from_the_derived_address(self):
-        import ipaddress
-
-        from charm import MicroCloudCharm
-
-        network = ipaddress.IPv6Network("fd2b:5d1a:7c93:6::/64")
-        stub = self._stub(
-            {"bgp-uplinks": "eth1,eth2", "snap-channel-microovn": "latest/edge"},
-            {network: ipaddress.IPv6Address("fd2b:5d1a:7c93:6:0:1:0:7")},
-        )
-        with patch("charm.bgp.ensure", return_value=None) as ensure:
-            assert MicroCloudCharm._ensure_bgp(stub) is None
-
-        conf = ensure.call_args.args[0]
-        assert "router id 0.0.0.7;" in conf
-        assert "local as 4200000007;" in conf
-        assert 'interface "eth1"' in conf and 'interface "eth2"' in conf
 
 
 # ---------------------------------------------------------------------------
@@ -1095,9 +1079,9 @@ class TestHeldStatus:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
-        stub._network.derived_addresses.return_value = {}
-        stub._ensure_bgp.return_value = None
-        stub._bgp_uplinks.return_value = []
+        stub._network.lo_problem.return_value = (None, None)
+        stub._network.lo_addresses.return_value = {}
+        stub._shared_address.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
@@ -1136,22 +1120,44 @@ class TestHeldStatus:
         )
         stub._coordinator.publish_identity.assert_not_called()
 
-    def test_a_loopback_problem_blocks(self):
-        import ops
-
+    def _lo_reconcile(self, lo_problem):
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
+        if isinstance(lo_problem, Exception):
+            stub._network.lo_problem.side_effect = lo_problem
+        else:
+            stub._network.lo_problem.return_value = lo_problem
         stub._coordinator = MagicMock()
-
-        with patch("charm.loopback.ensure", return_value="Cannot put addresses on lo: boom"):
+        with patch("charm.network.remove_legacy_files") as remove:
             MicroCloudCharm._reconcile(stub)
-
-        assert stub.unit.status == ops.BlockedStatus("Cannot put addresses on lo: boom")
+        remove.assert_called_once_with()
         stub._coordinator.publish_identity.assert_not_called()
+        return stub.unit.status
+
+    def test_a_problem_with_the_addresses_on_lo_blocks(self):
+        import ops
+
+        assert self._lo_reconcile(("2 addresses in fd00:3::/64", None)) == ops.BlockedStatus(
+            "2 addresses in fd00:3::/64"
+        )
+
+    def test_waits_for_the_machines_deployment_to_put_addresses_on_lo(self):
+        import ops
+
+        status = self._lo_reconcile((None, "Waiting for an address in fd00:3::/64 on lo"))
+        assert status == ops.WaitingStatus("Waiting for an address in fd00:3::/64 on lo")
+
+    def test_unreadable_addresses_block(self):
+        import ops
+
+        import network
+
+        status = self._lo_reconcile(network.HostNetworkError("ip: boom"))
+        assert status == ops.BlockedStatus("Cannot read this machine's addresses: ip: boom")
 
     def test_status_set_when_nothing_is_held(self):
         from charm import MicroCloudCharm
@@ -1162,9 +1168,9 @@ class TestHeldStatus:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
-        stub._network.derived_addresses.return_value = {}
-        stub._ensure_bgp.return_value = None
-        stub._bgp_uplinks.return_value = []
+        stub._network.lo_problem.return_value = (None, None)
+        stub._network.lo_addresses.return_value = {}
+        stub._shared_address.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
@@ -1551,9 +1557,9 @@ class TestGrowCharm:
         stub._network.bind_address.return_value = "10.0.0.1"
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
-        stub._network.derived_addresses.return_value = {}
-        stub._ensure_bgp.return_value = None
-        stub._bgp_uplinks.return_value = []
+        stub._network.lo_problem.return_value = (None, None)
+        stub._network.lo_addresses.return_value = {}
+        stub._shared_address.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
@@ -2612,9 +2618,9 @@ class TestFailureDomains:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
-        stub._network.derived_addresses.return_value = {}
-        stub._ensure_bgp.return_value = None
-        stub._bgp_uplinks.return_value = []
+        stub._network.lo_problem.return_value = (None, None)
+        stub._network.lo_addresses.return_value = {}
+        stub._shared_address.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
@@ -2747,9 +2753,9 @@ class TestFailureDomains:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
-        stub._network.derived_addresses.return_value = {}
-        stub._ensure_bgp.return_value = None
-        stub._bgp_uplinks.return_value = []
+        stub._network.lo_problem.return_value = (None, None)
+        stub._network.lo_addresses.return_value = {}
+        stub._shared_address.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
@@ -2875,7 +2881,6 @@ class TestOsdSteering:
         down=(),
         ok_to_stop=True,
         dump_error=None,
-        bind_address="fd00:0:0:1::6",
         public_networks=("fd00:0:0:400::/64", "fd00:0:0:401::/64", "fd00:0:0:402::/64"),
         daemons=None,
     ):
@@ -2895,11 +2900,15 @@ class TestOsdSteering:
             "ceph-internal-numa-networks": '{"0": "fd00:0:0:301::/64", "1": "fd00:0:0:302::/64"}',
         }
         stub.config.update(config or {})
-        # The real address derivation, with the cluster address the binding would give.
-        stub._network = UnitNetwork(MagicMock(), stub.config)
-        stub._network.bind_address = lambda: bind_address
         disks = {1: "/dev/a", 2: "/dev/b"} if disks is None else disks
         present = self.PRESENT if present is None else present
+        # The real address lookup on "lo". Only "lo" counts, even for an
+        # address in a NUMA /64.
+        held = {
+            "lo": {ipaddress.IPv6Address(a) for a in present},
+            "eth0": {ipaddress.IPv6Address("fd00:0:0:402::99")},
+        }
+        stub._network = UnitNetwork(MagicMock(), stub.config, lambda: held)
         dump = {f"osd.{osd}": options for osd, options in (current or {}).items()}
         public_networks = [ipaddress.IPv6Network(n) for n in public_networks]
 
@@ -2907,14 +2916,6 @@ class TestOsdSteering:
             patch("charm.microcloud.hostname", return_value="node1"),
             patch("charm.steering.local_disks", return_value=disks),
             patch("charm.steering.numa_node", side_effect={"/dev/a": 0, "/dev/b": 1}.get),
-            patch(
-                "charm.loopback.host_addresses",
-                return_value={
-                    "lo": {ipaddress.IPv6Address(a) for a in present},
-                    # Only "lo" counts, even for an address in a NUMA /64.
-                    "eth0": {ipaddress.IPv6Address("fd00:0:0:402::99")},
-                },
-            ),
             patch(
                 "charm.steering.config_dump",
                 **({"side_effect": dump_error} if dump_error else {"return_value": dump}),
@@ -3100,7 +3101,7 @@ class TestOsdSteering:
         restart.assert_not_called()
 
     def test_blocks_without_the_unsteered_addresses(self):
-        _, problem, apply, restart = self._run(bind_address="")
+        _, problem, apply, restart = self._run(present=self.PRESENT[2:])
         assert problem.startswith("NUMA steering needs the unsteered Ceph addresses")
         apply.assert_not_called()
         restart.assert_not_called()

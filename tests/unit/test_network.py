@@ -4,18 +4,30 @@
 """Unit tests for resolving this unit's network settings."""
 
 import ipaddress
+import json
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import ops
 import pytest
 
-from network import UnitNetwork, derive_address
+import network as network_module
+from network import HostNetworkError, UnitNetwork
+
+# conftest.py replaces these for every test, so keep the real ones to test them.
+host_addresses = network_module.host_addresses
+remove_legacy_files = network_module.remove_legacy_files
 
 
-def _network(*, config=None, binding=None):
+def _network(*, config=None, binding=None, addresses=None):
+    """Return a UnitNetwork whose machine holds ``addresses`` (interface to addresses)."""
     model = MagicMock(spec=ops.Model)
     model.get_binding.return_value = binding
-    return UnitNetwork(model, config or {})
+    held = {
+        interface: {ipaddress.IPv6Address(a) for a in found}
+        for interface, found in (addresses or {}).items()
+    }
+    return UnitNetwork(model, config or {}, lambda: held)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +210,7 @@ class TestOvnUplinkInterface:
 
 
 # ---------------------------------------------------------------------------
-# Network options (spaces with no interface: addresses derived, on "lo")
+# Network options (spaces with no interface: addresses on "lo")
 # ---------------------------------------------------------------------------
 
 CEPH_PUBLIC = "fd2b:5d1a:7c93:3::/64"
@@ -216,20 +228,6 @@ def _bound(address, subnet="fd2b:5d1a:7c93:2::/64"):
     return binding
 
 
-class TestDeriveAddress:
-    def test_keeps_the_host_part_of_the_source(self):
-        derived = derive_address(
-            ipaddress.IPv6Network(CEPH_PUBLIC), ipaddress.IPv6Address(OAM_ADDRESS)
-        )
-        assert str(derived) == "fd2b:5d1a:7c93:3:0:1:0:5"
-
-    def test_two_sources_never_derive_the_same_address(self):
-        network = ipaddress.IPv6Network(CEPH_PUBLIC)
-        first = derive_address(network, ipaddress.IPv6Address("fd2b:5d1a:7c93:2:0:1::"))
-        second = derive_address(network, ipaddress.IPv6Address("fd2b:5d1a:7c93:2:0:1:0:1"))
-        assert first != second
-
-
 class TestCephPool:
     def test_a_56_pool_uses_its_slot_0_64(self):
         network = _network(config={"ceph-internal-network": "fd2b:5d1a:7c93:300::/56"})
@@ -237,10 +235,11 @@ class TestCephPool:
             "fd2b:5d1a:7c93:300::/64"
         )
 
-    def test_the_slot_0_address_matches_the_pool_base(self):
+    def test_the_address_is_the_one_on_lo_in_slot_0(self):
+        """The steered addresses in the pool's other /64s are not this one."""
         network = _network(
             config={"ceph-public-network": "fd2b:5d1a:7c93:400::/56"},
-            binding=_bound("fd2b:5d1a:7c93:1:0:1:0:5"),
+            addresses={"lo": ["fd2b:5d1a:7c93:400:0:1:0:5", "fd2b:5d1a:7c93:401:0:1:0:5"]},
         )
         assert network.space_address("ceph-public") == "fd2b:5d1a:7c93:400:0:1:0:5"
         assert network.space_cidr("ceph-public") == "fd2b:5d1a:7c93:400::/64"
@@ -290,36 +289,73 @@ class TestNetworkOptionsProblem:
     def test_none_when_no_option_is_set(self):
         assert _network(binding=_bound("10.0.0.1")).network_options_problem() is None
 
-    def test_none_when_the_options_and_cluster_address_are_usable(self):
+    def test_none_when_the_options_are_usable(self):
         network = _network(
-            config={"ceph-public-network": CEPH_PUBLIC, "ovn-underlay-network": OVN_UNDERLAY},
-            binding=_bound(OAM_ADDRESS),
+            config={"ceph-public-network": CEPH_PUBLIC, "ovn-underlay-network": OVN_UNDERLAY}
         )
         assert network.network_options_problem() is None
 
     def test_an_option_that_is_not_an_ipv6_64_is_named(self):
-        network = _network(
-            config={"ceph-internal-network": "10.0.0.0/24"}, binding=_bound(OAM_ADDRESS)
-        )
+        network = _network(config={"ceph-internal-network": "10.0.0.0/24"})
         assert network.network_options_problem() == (
             "ceph-internal-network: '10.0.0.0/24' is not an IPv6 /64 or /56"
         )
 
-    def test_an_ipv4_cluster_address_cannot_be_derived_from(self):
+    def test_an_ipv4_cluster_address_is_fine(self):
+        """Nothing is derived from it: the addresses are found on lo."""
         network = _network(config={"ceph-public-network": CEPH_PUBLIC}, binding=_bound("10.0.0.1"))
-        assert network.network_options_problem() == (
-            "Cluster address 10.0.0.1 is not IPv6: cannot derive addresses from it"
-        )
-
-    def test_no_cluster_address_yet_is_not_a_problem(self):
-        network = _network(config={"ceph-public-network": CEPH_PUBLIC}, binding=_bound(""))
         assert network.network_options_problem() is None
 
 
-class TestSpaceAddress:
-    def test_derived_from_the_cluster_address_when_the_option_is_set(self):
+class TestLoProblem:
+    CONFIG = {"ceph-public-network": CEPH_PUBLIC, "ovn-underlay-network": OVN_UNDERLAY}
+
+    def test_none_with_one_address_on_lo_per_network(self):
         network = _network(
-            config={"ovn-underlay-network": OVN_UNDERLAY}, binding=_bound(OAM_ADDRESS)
+            config=self.CONFIG,
+            addresses={"lo": ["fd2b:5d1a:7c93:3::5", "fd2b:5d1a:7c93:1::5"]},
+        )
+        assert network.lo_problem() == (None, None)
+
+    def test_none_without_options(self):
+        assert _network(addresses={"eth0": [OAM_ADDRESS]}).lo_problem() == (None, None)
+
+    def test_waits_for_the_machines_deployment(self):
+        network = _network(config=self.CONFIG, addresses={"lo": ["fd2b:5d1a:7c93:1::5"]})
+        assert network.lo_problem() == (None, f"Waiting for an address in {CEPH_PUBLIC} on lo")
+
+    def test_two_addresses_in_one_network_block(self):
+        network = _network(
+            config=self.CONFIG,
+            addresses={
+                "lo": ["fd2b:5d1a:7c93:3::5", "fd2b:5d1a:7c93:1::5"],
+                "eth1": ["fd2b:5d1a:7c93:3::9"],
+            },
+        )
+        assert network.lo_problem() == (
+            f"2 addresses in {CEPH_PUBLIC}, from ceph-public-network: "
+            "fd2b:5d1a:7c93:3::5 on lo, fd2b:5d1a:7c93:3::9 on eth1",
+            None,
+        )
+
+    def test_an_address_on_another_interface_blocks(self):
+        network = _network(
+            config={"ovn-underlay-network": OVN_UNDERLAY},
+            addresses={"eth1": ["fd2b:5d1a:7c93:1::5"]},
+        )
+        assert network.lo_problem() == (
+            f"fd2b:5d1a:7c93:1::5 in {OVN_UNDERLAY}, from ovn-underlay-network, "
+            "is on eth1, not lo",
+            None,
+        )
+
+
+class TestSpaceAddress:
+    def test_the_address_on_lo_when_the_option_is_set(self):
+        network = _network(
+            config={"ovn-underlay-network": OVN_UNDERLAY},
+            binding=_bound(OAM_ADDRESS),
+            addresses={"lo": ["fd2b:5d1a:7c93:1:0:1:0:5"], "eth0": [OAM_ADDRESS]},
         )
         assert network.space_address("ovn-underlay") == "fd2b:5d1a:7c93:1:0:1:0:5"
 
@@ -327,7 +363,7 @@ class TestSpaceAddress:
         network = _network(binding=_bound("10.0.0.7"))
         assert network.space_address("ovn-underlay") == "10.0.0.7"
 
-    def test_empty_without_a_usable_cluster_address(self):
+    def test_empty_until_the_address_is_on_lo(self):
         network = _network(config={"ovn-underlay-network": OVN_UNDERLAY}, binding=_bound(""))
         assert network.space_address("ovn-underlay") == ""
 
@@ -344,20 +380,166 @@ class TestSpaceCidr:
         assert network.space_cidr("ceph-public") == "10.42.0.0/24"
 
 
-class TestDerivedAddresses:
+class TestLoAddresses:
     def test_one_address_per_configured_network(self):
         network = _network(
             config={"ceph-public-network": CEPH_PUBLIC, "ovn-underlay-network": OVN_UNDERLAY},
-            binding=_bound(OAM_ADDRESS),
+            addresses={"lo": ["fd2b:5d1a:7c93:3::5", "fd2b:5d1a:7c93:1::5", "fd00::1"]},
         )
-        assert network.derived_addresses() == {
-            ipaddress.IPv6Network(CEPH_PUBLIC): ipaddress.IPv6Address("fd2b:5d1a:7c93:3:0:1:0:5"),
-            ipaddress.IPv6Network(OVN_UNDERLAY): ipaddress.IPv6Address("fd2b:5d1a:7c93:1:0:1:0:5"),
+        assert network.lo_addresses() == {
+            ipaddress.IPv6Network(CEPH_PUBLIC): ipaddress.IPv6Address("fd2b:5d1a:7c93:3::5"),
+            ipaddress.IPv6Network(OVN_UNDERLAY): ipaddress.IPv6Address("fd2b:5d1a:7c93:1::5"),
         }
 
     def test_empty_when_no_option_is_set(self):
-        assert _network(binding=_bound(OAM_ADDRESS)).derived_addresses() == {}
+        assert _network(addresses={"lo": ["fd2b:5d1a:7c93:3::5"]}).lo_addresses() == {}
 
-    def test_empty_without_an_ipv6_cluster_address(self):
-        network = _network(config={"ceph-public-network": CEPH_PUBLIC}, binding=_bound("10.0.0.1"))
-        assert network.derived_addresses() == {}
+    def test_a_network_with_two_addresses_is_left_out(self):
+        network = _network(
+            config={"ceph-public-network": CEPH_PUBLIC},
+            addresses={"lo": ["fd2b:5d1a:7c93:3::5", "fd2b:5d1a:7c93:3::6"]},
+        )
+        assert network.lo_addresses() == {}
+
+    def test_empty_when_the_addresses_cannot_be_read(self):
+        def fail():
+            raise HostNetworkError("boom")
+
+        network = UnitNetwork(MagicMock(), {"ceph-public-network": CEPH_PUBLIC}, fail)
+        assert network.lo_addresses() == {}
+
+    def test_reads_the_machine_once(self):
+        read = MagicMock(return_value={})
+        network = UnitNetwork(MagicMock(), {"ceph-public-network": CEPH_PUBLIC}, read)
+        network.lo_addresses()
+        network.lo_problem()
+        read.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# The machine's addresses
+# ---------------------------------------------------------------------------
+
+
+def _ip_json(links):
+    return subprocess.CompletedProcess([], 0, stdout=json.dumps(links), stderr="")
+
+
+class TestHostAddresses:
+    def test_by_interface_with_deprecated_ones(self):
+        links = [
+            {
+                "ifname": "lo",
+                "addr_info": [
+                    {"family": "inet6", "local": "fd00:0:0:400::6", "scope": "global"},
+                    {
+                        "family": "inet6",
+                        "local": "fd00:0:0:401::6",
+                        "scope": "global",
+                        "deprecated": True,
+                        "preferred_life_time": 0,
+                    },
+                    {},
+                ],
+            },
+            {
+                "ifname": "eth0",
+                "addr_info": [{"family": "inet6", "local": "bad", "scope": "global"}],
+            },
+        ]
+        with patch("network.subprocess.run", return_value=_ip_json(links)) as run:
+            assert host_addresses() == {
+                "lo": {
+                    ipaddress.IPv6Address("fd00:0:0:400::6"),
+                    ipaddress.IPv6Address("fd00:0:0:401::6"),
+                }
+            }
+        assert list(run.call_args.args[0]) == [
+            "ip",
+            "-json",
+            "-6",
+            "address",
+            "show",
+            "scope",
+            "global",
+        ]
+
+    def test_an_error_is_raised(self):
+        error = subprocess.CalledProcessError(1, ["ip"], stderr="nope")
+        with patch("network.subprocess.run", side_effect=error):
+            with pytest.raises(HostNetworkError, match="nope"):
+                host_addresses()
+
+
+class TestReachable:
+    def test_an_answer(self):
+        done = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with patch("network.subprocess.run", return_value=done) as run:
+            assert network_module.reachable("fd00::5", "fd00::6")
+        assert list(run.call_args.args[0]) == [
+            "ping",
+            "-6",
+            "-c",
+            "1",
+            "-W",
+            "2",
+            "-I",
+            "fd00::5",
+            "fd00::6",
+        ]
+
+    def test_no_answer(self):
+        error = subprocess.CalledProcessError(1, ["ping"], stderr="")
+        with patch("network.subprocess.run", side_effect=error):
+            assert not network_module.reachable("fd00::5", "fd00::6")
+
+
+class TestRemoveLegacyFiles:
+    LEGACY = (
+        "network:\n  version: 2\n  ethernets:\n    lo:\n      addresses:\n        - fd00::5/128\n"
+    )
+
+    def _files(self, tmp_path, netplan_files, dropins):
+        netplan = tmp_path / "netplan"
+        networkd = tmp_path / "networkd.conf.d"
+        netplan.mkdir()
+        networkd.mkdir()
+        for name, content in netplan_files.items():
+            (netplan / name).write_text(content)
+        for name, content in dropins.items():
+            (networkd / name).write_text(content)
+        return netplan / "90-microcloud-lo.yaml", networkd / "90-microcloud-bgp.conf"
+
+    def test_removed_once_the_deployment_holds_the_same(self, tmp_path):
+        ours, dropin = self._files(
+            tmp_path,
+            {
+                "90-microcloud-lo.yaml": self.LEGACY,
+                "89-deployment-lo.yaml": (
+                    "network:\n  ethernets:\n    lo:\n      addresses:\n"
+                    "        - fd00::5/128\n"
+                    '        - "fd00:1::5/128":\n            lifetime: 0\n'
+                ),
+            },
+            {
+                "90-microcloud-bgp.conf": "[Network]\nManageForeignRoutes=no\n",
+                "89-other.conf": "[Network]\nManageForeignRoutes=no\n",
+            },
+        )
+        remove_legacy_files(ours, dropin)
+        assert not ours.exists()
+        assert not dropin.exists()
+
+    def test_kept_while_nothing_else_holds_them(self, tmp_path):
+        ours, dropin = self._files(
+            tmp_path,
+            {"90-microcloud-lo.yaml": self.LEGACY, "50-cloud-init.yaml": "network: {}\n"},
+            {"90-microcloud-bgp.conf": "[Network]\nManageForeignRoutes=no\n"},
+        )
+        remove_legacy_files(ours, dropin)
+        assert ours.exists()
+        assert dropin.exists()
+
+    def test_nothing_to_remove(self, tmp_path):
+        ours, dropin = self._files(tmp_path, {}, {})
+        remove_legacy_files(ours, dropin)

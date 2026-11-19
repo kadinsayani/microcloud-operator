@@ -338,20 +338,23 @@ config:
     # Networks with no interface on the machines: each machine's address
     # in them sits on "lo" and is reached over BGP. Juju cannot place a
     # unit on a machine with no interface in a bound space, so name these
-    # networks here and leave their endpoints out of "--bind". The charm
-    # puts each unit's address on "lo" and in
-    # /etc/netplan/90-microcloud-lo.yaml; advertising it is left to the
-    # machine's routing daemon.
+    # networks here and leave their endpoints out of "--bind". The
+    # machine's deployment puts each machine's addresses on "lo" and
+    # advertises them; the charm only finds them there.
     # ------------------------------------------------------------------
     ceph-public-network:
       type: string
       default: ""
       description: >
         IPv6 /64 of the Ceph public network, e.g. "fd00:3::/64", or a /56
-        pool, e.g. "fd00:400::/56", whose first /64 (slot 0) is used. When
-        set, it replaces the "ceph-public" binding. Each unit's address in
-        it is that /64 with the host part of the unit's cluster address. A
-        unit blocks if its machine holds another address in that /64.
+        pool, e.g. "fd00:400::/56", whose first /64 (slot 0) is used. Set it
+        for a network with no interface on the machines, whose addresses the
+        machine's deployment puts on "lo" and routes. When set, it replaces
+        the "ceph-public" binding: each unit's address in it is the one
+        address on "lo" inside that /64. A unit waits until the address is
+        there, and blocks if its machine holds more than one address in that
+        /64, or holds it on another interface, or if another unit has the
+        same address. The charm writes no addresses or routes.
 
     ceph-internal-network:
       type: string
@@ -366,21 +369,9 @@ config:
       default: ""
       description: >
         IPv6 /64 of the OVN underlay network. When set, it replaces the
-        "ovn-underlay" binding: each unit's underlay address is this /64
-        with the host part of the unit's cluster address.
-
-    bgp-uplinks:
-      type: string
-      default: ""
-      description: >
-        Comma-separated interfaces that link the machine to a routed fabric,
-        e.g. "eth1,eth2". When set, the charm advertises each unit's
-        addresses in the networks above over BGP on these interfaces, with
-        BIRD from the MicroOVN snap, and runs nothing else from that snap:
-        MicroOVN is not added to the cluster. Each interface peers with the
-        router it finds from Router Advertisements. Needs
-        "snap-channel-microovn" for the snap, and at least one of the
-        network options above.
+        "ovn-underlay" binding, as "ceph-public-network" does for the Ceph
+        public network: each unit's underlay address is the one address on
+        "lo" inside this /64.
 
     # ------------------------------------------------------------------
     # Observability options (used only when cos-agent is related)
